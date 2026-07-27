@@ -1,5 +1,7 @@
 package com.malife.demo.core.service;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -11,8 +13,11 @@ import org.springframework.stereotype.Component;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
+import redis.clients.jedis.ConnectionPoolConfig;
+import redis.clients.jedis.DefaultJedisClientConfig;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.RedisClient;
+import redis.clients.jedis.exceptions.JedisConnectionException;
 
 @Component
 public class Store {
@@ -29,21 +34,33 @@ public class Store {
     // 스레드 안정을 위한 ConcurrentHashMap
     private final Map<String, String> tokens = new ConcurrentHashMap<>();
 
-    private RedisClient redisClient;
-
     @Value("${spring.data.redis.host:localhost}")
     private String redisHost;
 
-    @Value("${spring.data.redis.port:6379}")
-    private int redisPort;
+    // 5개의 포트를 콤마(,) 구분자로 전달받음
+    @Value("${spring.data.redis.ports:6379,6380,6381,6382,6383}")
+    private String redisPortsConfig;
+
+    @Value("${spring.data.redis.username:}")
+    private String redisUsername;
+
+    @Value("${spring.data.redis.password:}")
+    private String redisPassword;
+
+    @Value("${spring.data.redis.timeout:2000}")
+    private int timeout;
+
+    private List<Integer> redisPorts;
+    
+    // Jedis 7.5.2 권장: 포트별 RedisClient 관리
+    private final Map<Integer, RedisClient> clientMap = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void init() {
-        // Jedis 7.5.2 규격: HostAndPort 객체를 통한 RedisClient 생성
-        HostAndPort endpoint = new HostAndPort(redisHost, redisPort);
-        this.redisClient = RedisClient.builder()
-                .hostAndPort(endpoint)
-                .build();
+        this.redisPorts = Arrays.stream(redisPortsConfig.split(","))
+                .filter(s -> s.matches("^\\s*[0-9]+\\s*$"))
+                .map(s -> Integer.parseInt(s.trim()))
+                .toList();
 
         // 초기화 시 매핑된 키의 모든 토큰 로드
         refreshAllTokens();
@@ -75,9 +92,6 @@ public class Store {
 
     /**
      * 단일 Redis Key에 해당하는 토큰을 조회하여 local 메모리(tokens)에 업데이트
-     * 
-     * @param key Redis Key (예: "int:pub:auth")
-     * @return 갱신 성공 여부
      */
     public boolean refreshTokenByKey(String key) {
         String url = this.keyMap.get(key);
@@ -87,7 +101,8 @@ public class Store {
         }
 
         try {
-            String token = this.redisClient.get(key);
+            // 5개 포트를 순회하며 성공할 때까지 execution 시도
+            String token = executeWithFailover(client -> client.get(key));
 
             if (token != null) {
                 this.tokens.put(url, token);
@@ -103,11 +118,75 @@ public class Store {
         }
     }
 
+    /**
+     * 5개 포트를 순차적으로 시도하여 Redis 명령을 실행하는 Failover 로직
+     */
+    private <T> T executeWithFailover(RedisCommand<T> command) {
+        for (int port : redisPorts) {
+            try {
+                RedisClient client = getOrCreateClient(port);
+                return command.execute(client);
+            } catch (JedisConnectionException e) {
+                log.warn("Redis 접속 실패 [Host: {}, Port: {}] - 다음 포트로 재시도합니다. (Error: {})", 
+                        redisHost, port, e.getMessage());
+            } catch (Exception e) {
+                log.error("Redis 작업 처리 중 오류 발생 [Port: {}]", port, e);
+            }
+        }
+        throw new RuntimeException("모든 지정된 포트(" + redisPorts + ")로의 Redis 접속에 실패했습니다.");
+    }
+
+    /**
+     * Jedis 7.5.2 공식 규격에 맞춰 RedisClient 생성 및 캐싱
+     */
+    private synchronized RedisClient getOrCreateClient(int port) {
+        return clientMap.computeIfAbsent(port, p -> {
+            // 1. 인증 및 타임아웃 설정 (DefaultJedisClientConfig)
+            DefaultJedisClientConfig.Builder configBuilder = DefaultJedisClientConfig.builder()
+                    .timeoutMillis(timeout);
+
+            if (redisUsername != null && !redisUsername.isBlank()) {
+                configBuilder.user(redisUsername);
+            }
+            if (redisPassword != null && !redisPassword.isBlank()) {
+                configBuilder.password(redisPassword);
+            }
+
+            // 2. 풀 커넥션 설정 (ConnectionPoolConfig)
+            ConnectionPoolConfig poolConfig = new ConnectionPoolConfig();
+            poolConfig.setMaxTotal(10);
+            poolConfig.setMaxIdle(5);
+            poolConfig.setMinIdle(1);
+
+            // 3. RedisClient 빌드 (7.5.2 매뉴얼 표준)
+            HostAndPort hostAndPort = new HostAndPort(redisHost, p);
+            log.info("Creating RedisClient for {}:{}", redisHost, p);
+
+            return RedisClient.builder()
+                    .hostAndPort(hostAndPort)
+                    .clientConfig(configBuilder.build())
+                    .poolConfig(poolConfig)
+                    .build();
+        });
+    }
+
+    @FunctionalInterface
+    private interface RedisCommand<T> {
+        T execute(RedisClient client);
+    }
+
     @PreDestroy
     public void close() {
-        if (this.redisClient != null) {
-            this.redisClient.close();
-            log.info("RedisClient 접속 자원 해제 완료");
-        }
+        clientMap.forEach((port, client) -> {
+            if (client != null) {
+                try {
+                    client.close();
+                    log.info("RedisClient closed for port: {}", port);
+                } catch (Exception e) {
+                    log.error("Error closing RedisClient for port: {}", port, e);
+                }
+            }
+        });
+        clientMap.clear();
     }
 }
